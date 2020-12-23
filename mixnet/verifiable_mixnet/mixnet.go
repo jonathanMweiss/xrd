@@ -48,6 +48,9 @@ type Mix interface {
 	// returns some result, and whether the processing is successful
 	SetAuxProcessor(round int, auxProcessor AuxProcessor) error
 
+	// responsible for stopping the mixnet, cleaning resources and removing anything else.
+	Terminate(round int) error
+
 	// AddMessage takes in some messages and decrypt.
 	AddMessages(round int, msgs [][]byte) error
 
@@ -83,6 +86,19 @@ type server struct {
 	smu    sync.RWMutex
 	states map[int]*roundState
 	dw     DecryptionWorker
+}
+
+func (srv *server) Terminate(round int) error {
+	srv.smu.RLock()
+	state, ok := srv.states[round]
+	srv.smu.RUnlock()
+	if !ok {
+		return errors.New("Mixnet-AddMessages: Round not yet started")
+	}
+	close(state.stop)
+	state.msgAddWg.Wait()
+
+	return srv.EndRound(round)
 }
 
 type DecryptionJob struct {
@@ -132,6 +148,11 @@ type roundState struct {
 	prodSet         []*sync.WaitGroup
 	products        []point // maps index to the product
 	verified        *sync.WaitGroup
+
+	// used to terminate the mix
+	stop chan bool
+	// waits for all async writers to stop.
+	msgAddWg *sync.WaitGroup
 }
 
 func NewMix(dw DecryptionWorker) Mix {
@@ -214,8 +235,8 @@ func (srv *server) EndRound(round int) error {
 	close(state.jobs)
 
 	srv.smu.Lock()
-	defer srv.smu.Unlock()
 	delete(srv.states, round)
+	srv.smu.Unlock()
 	return nil
 }
 
@@ -286,7 +307,17 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 
 	state.decWg.Add(len(msgs))
 
+	state.msgAddWg.Add(1)
 	go func(state *roundState) {
+		defer state.msgAddWg.Done()
+
+		// check if this round needs to stop before continuing
+		select {
+		case <-state.stop:
+			return
+		default:
+		}
+
 		for i, msg := range msgs {
 			job := DecryptionJob{
 				PrivateKey:   state.privateKey,
@@ -304,7 +335,11 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 				job.ProdJob = state.prodJobs[state.config.Index+1]
 			}
 
-			state.jobs <- job
+			select {
+			case state.jobs <- job:
+			case <-state.stop:
+				return
+			}
 		}
 	}(state)
 	return nil
