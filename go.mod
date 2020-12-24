@@ -1,4 +1,4 @@
-module github.com/jonathanmweiss/xrd
+module github.com/jonathanMweiss/xrd
 
 go 1.14
 
