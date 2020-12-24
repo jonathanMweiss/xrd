@@ -183,6 +183,9 @@ func (srv *server) NewRound(round int, config RoundConfiguration) error {
 		jobs:  make(chan DecryptionJob, nWorkers),
 		rlock: new(sync.Mutex),
 		mixed: false,
+
+		stop:     make(chan bool),
+		msgAddWg: new(sync.WaitGroup),
 	}
 
 	dw := srv.dw
