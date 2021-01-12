@@ -6,6 +6,9 @@ import (
 	"math/big"
 	"runtime"
 	"sync"
+
+	"go.dedis.ch/kyber/v3"
+	"go.dedis.ch/kyber/v3/suites"
 )
 
 type RoundConfiguration struct {
@@ -40,6 +43,8 @@ type Mix interface {
 	SetRoundKey(round int, publicKey, privateKey []byte) error
 	// RoundKey returns the onion encryption key for the round.
 	RoundKey(round int) ([]byte, error)
+	//sets up a suite to use.
+	SetRoundSuite(round int, suite suites.Suite) error
 	// RoundConfiguration gets the config
 	RoundConfiguration(round int) (RoundConfiguration, error)
 	// SetAuxProcessor takes in a function that will be used to
@@ -88,6 +93,19 @@ type server struct {
 	dw     DecryptionWorker
 }
 
+func (srv *server) SetRoundSuite(round int, suite suites.Suite) error {
+	srv.smu.RLock()
+	state, ok := srv.states[round]
+	srv.smu.RUnlock()
+	if !ok {
+		return errors.New("Mixnet-AddMessages: Round not yet started")
+	}
+	state.Lock()
+	state.suite = suite
+	state.Unlock()
+	return nil
+}
+
 func (srv *server) Terminate(round int) error {
 	srv.smu.RLock()
 	state, ok := srv.states[round]
@@ -112,8 +130,9 @@ type DecryptionJob struct {
 	Result [][]byte
 
 	// for verifiable decryption
-	ProdWg  *sync.WaitGroup
-	ProdJob chan []byte
+	ProdWg          *sync.WaitGroup
+	ProdJob         chan []byte
+	KyberPrivateKey kyber.Scalar
 }
 
 type roundState struct {
@@ -152,7 +171,9 @@ type roundState struct {
 	// used to terminate the mix
 	stop chan bool
 	// waits for all async writers to stop.
-	msgAddWg *sync.WaitGroup
+	msgAddWg        *sync.WaitGroup
+	kyberPrivateKey kyber.Scalar
+	suite           suites.Suite
 }
 
 func NewMix(dw DecryptionWorker) Mix {
@@ -252,8 +273,19 @@ func (srv *server) SetRoundKey(round int, publicKey, privateKey []byte) error {
 	}
 	var priv [BOX_KEY_SIZE]byte
 	copy(priv[:], privateKey)
+
 	state.publicKey = publicKey
 	state.privateKey = &priv
+
+	suite := state.suite
+	if suite == nil {
+		return nil
+	}
+	skey := suite.Scalar()
+	if err := skey.UnmarshalBinary(privateKey); err == nil {
+		state.kyberPrivateKey = skey
+	}
+
 	return nil
 }
 
@@ -323,9 +355,10 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 
 		for i, msg := range msgs {
 			job := DecryptionJob{
-				PrivateKey:   state.privateKey,
-				Ciphertext:   msg,
-				AuxProcessor: state.auxProcessor,
+				PrivateKey:      state.privateKey,
+				Ciphertext:      msg,
+				AuxProcessor:    state.auxProcessor,
+				KyberPrivateKey: state.kyberPrivateKey,
 
 				PrivateBlindKey: state.privateBlindKey,
 
