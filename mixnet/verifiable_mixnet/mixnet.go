@@ -174,6 +174,7 @@ type roundState struct {
 	msgAddWg        *sync.WaitGroup
 	kyberPrivateKey kyber.Scalar
 	suite           suites.Suite
+	workerWg        *sync.WaitGroup
 }
 
 func NewMix(dw DecryptionWorker) Mix {
@@ -207,6 +208,8 @@ func (srv *server) NewRound(round int, config RoundConfiguration) error {
 
 		stop:     make(chan bool),
 		msgAddWg: new(sync.WaitGroup),
+
+		workerWg: &sync.WaitGroup{},
 	}
 
 	dw := srv.dw
@@ -214,8 +217,12 @@ func (srv *server) NewRound(round int, config RoundConfiguration) error {
 		dw = defaultDecryptionWorker
 	}
 
+	state.workerWg.Add(nWorkers)
 	for i := 0; i < nWorkers; i++ {
-		go dw(&nonce, state.config.AuxSize, state.decWg, state.jobs)
+		go func() {
+			dw(&nonce, state.config.AuxSize, state.decWg, state.jobs)
+			state.workerWg.Done()
+		}()
 	}
 
 	if config.Verifiable {
@@ -257,6 +264,7 @@ func (srv *server) EndRound(round int) error {
 	}
 
 	close(state.jobs)
+	state.workerWg.Wait()
 
 	srv.smu.Lock()
 	delete(srv.states, round)
