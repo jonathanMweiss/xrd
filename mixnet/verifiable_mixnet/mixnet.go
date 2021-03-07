@@ -87,10 +87,20 @@ type Mix interface {
 	ConfirmVerification(round int, success bool) error
 }
 
+type KeyPair struct {
+	Public []byte
+	Shared [32]byte
+}
+type Keystore struct {
+	Memory map[string][32]byte
+	Mu     *sync.RWMutex
+}
+
 type server struct {
 	smu    sync.RWMutex
 	states map[int]*roundState
 	dw     DecryptionWorker
+	store  Keystore
 }
 
 func (srv *server) SetRoundSuite(round int, suite suites.Suite) error {
@@ -133,6 +143,8 @@ type DecryptionJob struct {
 	ProdWg          *sync.WaitGroup
 	ProdJob         chan []byte
 	KyberPrivateKey kyber.Scalar
+	Keypairs        []KeyPair
+	Keystore        Keystore
 }
 
 type roundState struct {
@@ -175,12 +187,18 @@ type roundState struct {
 	kyberPrivateKey kyber.Scalar
 	suite           suites.Suite
 	workerWg        *sync.WaitGroup
+	keypairs        [][]KeyPair
 }
 
 func NewMix(dw DecryptionWorker) Mix {
 	s := &server{
 		states: make(map[int]*roundState),
 		dw:     dw,
+
+		store: Keystore{
+			Memory: map[string][32]byte{},
+			Mu:     &sync.RWMutex{},
+		},
 	}
 	return s
 }
@@ -264,10 +282,22 @@ func (srv *server) EndRound(round int) error {
 	}
 
 	close(state.jobs)
-	state.workerWg.Wait()
+	state.workerWg.Wait() // waiting for the workers to stop.
 
 	srv.smu.Lock()
+	keyPairs := state.keypairs
 	delete(srv.states, round)
+
+	srv.store.Mu.Lock()
+	for _, keys := range keyPairs {
+		for _, key := range keys {
+			if len(key.Public) > 0 {
+				srv.store.Memory[string(key.Public)] = key.Shared
+			}
+		}
+	}
+	srv.store.Mu.Unlock()
+
 	srv.smu.Unlock()
 	return nil
 }
@@ -338,6 +368,7 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 	}
 
 	result := make([][]byte, len(msgs))
+	keypairs := make([]KeyPair, len(msgs))
 
 	state.Lock()
 	if state.mixed {
@@ -345,6 +376,7 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 		return errors.New("Current round has already been mixed")
 	}
 	state.results = append(state.results, result)
+	state.keypairs = append(state.keypairs, keypairs)
 	state.cnt += len(msgs)
 	state.Unlock()
 
@@ -370,8 +402,10 @@ func (srv *server) AddMessages(round int, msgs [][]byte) error {
 
 				PrivateBlindKey: state.privateBlindKey,
 
-				Idx:    i,
-				Result: result,
+				Idx:      i,
+				Result:   result,
+				Keypairs: keypairs,
+				Keystore: srv.store,
 			}
 
 			if !state.config.Last && state.config.Verifiable {
